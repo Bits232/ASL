@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Camera, CameraOff, Upload, AlertCircle, CheckCircle, Hand, RefreshCw, Eye } from 'lucide-react';
 import { useMediaPipeHands } from '../hooks/useMediaPipeHands';
@@ -26,48 +26,86 @@ const ASLRecognitionCamera: React.FC<ASLRecognitionCameraProps> = ({ onDetection
   // ASL Model integration
   const { model, isLoading: isModelLoading, error: modelError, predict } = useASLModel();
 
-  // Prediction timing
+  // Prediction timing with throttling
   const lastPredictionTime = useRef<number>(0);
+  const predictionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Start webcam with error handling
-  const startWebcam = async () => {
+  // Cleanup function for stream
+  const cleanupStream = useCallback(() => {
+    if (stream) {
+      stream.getTracks().forEach(track => {
+        track.stop();
+        console.log('Stopped track:', track.kind, track.label);
+      });
+      setStream(null);
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+  }, [stream]);
+
+  // Start webcam with improved error handling
+  const startWebcam = useCallback(async () => {
     try {
-      // Stop existing stream
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-        setStream(null);
-      }
-
+      // Clean up existing stream first
+      cleanupStream();
+      
       setVideoError(null);
       setIsVideoReady(false);
 
-      const constraints = {
+      // Request camera with conservative settings
+      const constraints: MediaStreamConstraints = {
         video: {
-          width: { ideal: 640, max: 1280 },
-          height: { ideal: 480, max: 720 },
+          width: { ideal: 640, max: 640 },
+          height: { ideal: 480, max: 480 },
           facingMode: 'user',
-          frameRate: { ideal: 15, max: 30 }
+          frameRate: { ideal: 15, max: 20 } // Lower frame rate to reduce load
         }
       };
 
       const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = mediaStream;
-        setStream(mediaStream);
-        
-        // Wait for video to be ready
-        videoRef.current.onloadedmetadata = () => {
-          if (videoRef.current) {
-            videoRef.current.play().then(() => {
-              setIsVideoReady(true);
-            }).catch(error => {
-              console.error('Error playing video:', error);
-              setVideoError('Failed to start video playback');
-            });
-          }
-        };
+      
+      if (!videoRef.current) {
+        // Component unmounted, cleanup
+        mediaStream.getTracks().forEach(track => track.stop());
+        return;
       }
+
+      setStream(mediaStream);
+      videoRef.current.srcObject = mediaStream;
+      
+      // Handle video events
+      const video = videoRef.current;
+      
+      const handleLoadedMetadata = () => {
+        if (video && !video.paused) {
+          setIsVideoReady(true);
+        }
+      };
+
+      const handleError = (error: Event) => {
+        console.error('Video error:', error);
+        setVideoError('Video playback failed');
+        cleanupStream();
+      };
+
+      video.addEventListener('loadedmetadata', handleLoadedMetadata);
+      video.addEventListener('error', handleError);
+      
+      // Auto-play video
+      try {
+        await video.play();
+      } catch (playError) {
+        console.error('Video play error:', playError);
+        setVideoError('Failed to start video playback');
+      }
+
+      // Cleanup event listeners
+      return () => {
+        video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+        video.removeEventListener('error', handleError);
+      };
+
     } catch (error) {
       console.error('Error accessing webcam:', error);
       let errorMessage = 'Unable to access webcam.';
@@ -79,51 +117,86 @@ const ASLRecognitionCamera: React.FC<ASLRecognitionCameraProps> = ({ onDetection
           errorMessage = 'No camera found. Please connect a camera.';
         } else if (error.name === 'NotReadableError') {
           errorMessage = 'Camera is being used by another application.';
+        } else if (error.name === 'OverconstrainedError') {
+          errorMessage = 'Camera constraints not supported.';
         }
       }
       
       setVideoError(errorMessage);
     }
-  };
+  }, [cleanupStream, retryCount]);
 
-  // Initialize webcam on mount
-  useEffect(() => {
-    startWebcam();
+  // Throttled prediction function
+  const makePrediction = useCallback(async () => {
+    if (!handsResult.isDetected || handsResult.landmarks.length === 0) {
+      setCurrentPrediction(null);
+      return;
+    }
 
-    return () => {
-      if (stream) {
-        stream.getTracks().forEach(track => track.stop());
-      }
-    };
-  }, [retryCount]);
+    const now = Date.now();
+    
+    // Throttle predictions to every 2 seconds to reduce load
+    if (now - lastPredictionTime.current < 2000) {
+      return;
+    }
 
-  // Handle predictions when hands are detected
-  useEffect(() => {
-    const makePrediction = async () => {
-      if (handsResult.isDetected && handsResult.landmarks.length > 0) {
-        const now = Date.now();
-        
-        // Throttle predictions to every 1 second
-        if (now - lastPredictionTime.current > 1000) {
-          lastPredictionTime.current = now;
-          
-          try {
-            const prediction = await predict(handsResult.landmarks[0]);
-            setCurrentPrediction(prediction);
-            onDetection(prediction.letter, prediction.confidence);
-          } catch (error) {
-            console.error('Error making prediction:', error);
-          }
-        }
-      } else {
+    lastPredictionTime.current = now;
+    
+    // Clear any existing timeout
+    if (predictionTimeoutRef.current) {
+      clearTimeout(predictionTimeoutRef.current);
+    }
+
+    // Debounce prediction to avoid rapid calls
+    predictionTimeoutRef.current = setTimeout(async () => {
+      try {
+        const prediction = await predict(handsResult.landmarks[0]);
+        setCurrentPrediction(prediction);
+        onDetection(prediction.letter, prediction.confidence);
+      } catch (error) {
+        console.error('Error making prediction:', error);
         setCurrentPrediction(null);
       }
-    };
+    }, 300);
+  }, [handsResult, predict, onDetection]);
 
+  // Handle predictions with proper cleanup
+  useEffect(() => {
     if (isMediaPipeReady && !isModelLoading) {
       makePrediction();
     }
-  }, [handsResult, isMediaPipeReady, isModelLoading, predict, onDetection]);
+
+    return () => {
+      if (predictionTimeoutRef.current) {
+        clearTimeout(predictionTimeoutRef.current);
+      }
+    };
+  }, [handsResult, isMediaPipeReady, isModelLoading, makePrediction]);
+
+  // Initialize webcam on mount
+  useEffect(() => {
+    const cleanup = startWebcam();
+    
+    return () => {
+      if (cleanup && typeof cleanup === 'function') {
+        cleanup();
+      }
+      cleanupStream();
+      if (predictionTimeoutRef.current) {
+        clearTimeout(predictionTimeoutRef.current);
+      }
+    };
+  }, [startWebcam, cleanupStream]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      cleanupStream();
+      if (predictionTimeoutRef.current) {
+        clearTimeout(predictionTimeoutRef.current);
+      }
+    };
+  }, [cleanupStream]);
 
   const handleRetry = () => {
     setRetryCount(prev => prev + 1);
@@ -349,6 +422,7 @@ const ASLRecognitionCamera: React.FC<ASLRecognitionCameraProps> = ({ onDetection
           <p>• Model: {model ? '✅ Custom model loaded' : '🔄 Using heuristic classification'}</p>
           <p>• Hand landmarks: {handsResult.landmarks[0]?.length || 0}/21 detected</p>
           <p>• Features extracted: {handsResult.landmarks[0] ? '63 landmark + 10 distance = 73 total' : 'None'}</p>
+          <p>• Stream status: {stream ? '🟢 Active' : '🔴 Inactive'}</p>
         </div>
       </div>
     </div>
