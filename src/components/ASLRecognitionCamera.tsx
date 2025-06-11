@@ -77,9 +77,15 @@ const ASLRecognitionCamera: React.FC<ASLRecognitionCameraProps> = ({ onDetection
       // Handle video events
       const video = videoRef.current;
       
-      const handleLoadedMetadata = () => {
+      const handleLoadedMetadata = async () => {
         if (video && !video.paused) {
-          setIsVideoReady(true);
+          try {
+            await video.play();
+            setIsVideoReady(true);
+          } catch (playError) {
+            console.error('Video play error:', playError);
+            setVideoError('Failed to start video playback');
+          }
         }
       };
 
@@ -92,14 +98,6 @@ const ASLRecognitionCamera: React.FC<ASLRecognitionCameraProps> = ({ onDetection
       video.addEventListener('loadedmetadata', handleLoadedMetadata);
       video.addEventListener('error', handleError);
       
-      // Auto-play video
-      try {
-        await video.play();
-      } catch (playError) {
-        console.error('Video play error:', playError);
-        setVideoError('Failed to start video playback');
-      }
-
       // Cleanup event listeners
       return () => {
         video.removeEventListener('loadedmetadata', handleLoadedMetadata);
